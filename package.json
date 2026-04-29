@@ -1,0 +1,20 @@
+{
+  "name": "immoclaude-bot",
+  "version": "1.0.0",
+  "description": "Playwright automation for immocloud DATEV exports",
+  "main": "src/datev-report.js",
+  "scripts": {
+    "datev": "node src/datev-report.js",
+    "webhook": "node src/send-files-to-webhook.js",
+    "google-sheets": "node src/send-files-to-google-sheets.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "googleapis": "^171.4.0",
+    "playwright": "^1.59.1",
+    "xlsx": "^0.18.5"
+  }
+}
