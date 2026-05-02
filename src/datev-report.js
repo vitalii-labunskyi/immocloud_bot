@@ -58,6 +58,7 @@ const LABELS = {
   reportButton: 'Jetzt erstellen',
   period: 'Zeitraum',
   owner: 'Eigentümer',
+  ownerRestriction: 'Objekte auf Eigentümer einschränken',
   fiscalYear: 'Wirtschaftsjahr Beginn',
   keepGoing: 'Trotzdem exportieren',
   datevTitle: 'DATEV-Export',
@@ -679,6 +680,12 @@ async function writeOAuthTokens(tokens) {
   await fs.writeFile(GOOGLE_OAUTH_TOKEN_FILE, JSON.stringify(tokens, null, 2));
 }
 
+function isInvalidGrantError(error) {
+  return error?.message === 'invalid_grant'
+    || error?.response?.data?.error === 'invalid_grant'
+    || error?.errors?.some?.((entry) => entry?.reason === 'invalid_grant');
+}
+
 function askForCodeInteractively(authUrl) {
   return new Promise((resolve) => {
     console.log('Open this URL, approve access, then paste the returned code:');
@@ -766,17 +773,28 @@ async function authorizeWithOAuth() {
     });
   });
 
+  const authorizeFresh = async () => {
+    const code = await getOAuthCode(oauth2Client);
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+    await writeOAuthTokens(tokens);
+    return oauth2Client;
+  };
+
   const cachedTokens = await readCachedOAuthTokens();
   if (cachedTokens) {
     oauth2Client.setCredentials(cachedTokens);
-    return oauth2Client;
+    try {
+      await oauth2Client.getAccessToken();
+      return oauth2Client;
+    } catch (error) {
+      if (!isInvalidGrantError(error)) throw error;
+      await fs.unlink(GOOGLE_OAUTH_TOKEN_FILE).catch(() => {});
+      console.log(`Cached Google OAuth token is invalid. Re-authorizing ${GOOGLE_OAUTH_TOKEN_FILE}.`);
+    }
   }
 
-  const code = await getOAuthCode(oauth2Client);
-  const { tokens } = await oauth2Client.getToken(code);
-  oauth2Client.setCredentials(tokens);
-  await writeOAuthTokens(tokens);
-  return oauth2Client;
+  return authorizeFresh();
 }
 
 async function ensureSpreadsheetDefaultSheetTitle(sheetsClient, spreadsheetId) {
@@ -1107,24 +1125,204 @@ async function fillFiscalYear(page, fiscalYearStart) {
   await input.press('Tab');
 }
 
-async function openOwnerSelector(page) {
-  const column = page.locator('div.col-4').filter({ hasText: LABELS.owner }).first();
-  await column.waitFor({ state: 'visible', timeout: TIMEOUT_MS });
+function getOwnerColumn(page) {
+  return page.locator(
+    'xpath=//div[contains(concat(" ", normalize-space(@class), " "), " col-4 ")][.//div[contains(concat(" ", normalize-space(@class), " "), " input-title ") and normalize-space(.)="Eigentümer"]]',
+  ).first();
+}
 
-  let trigger = column.locator('[role="combobox"], .p-multiselect, button').first();
-  if (!(await trigger.count())) {
-    trigger = column.locator('input').first();
+async function ensureToggleEnabled(page, labelText) {
+  const row = page.locator(`xpath=//p[normalize-space(.)="${labelText}"]/..`).first();
+  if (!(await row.count().catch(() => 0))) return false;
+
+  const input = row.locator('input[type="checkbox"], .p-toggleswitch-input').first();
+  if (!(await input.count().catch(() => 0))) return false;
+
+  const checked = await input.isChecked().catch(async () => {
+    const root = row.locator('.p-toggleswitch').first();
+    return (await root.getAttribute('data-p-checked').catch(() => 'true')) === 'true';
+  });
+  if (checked) return true;
+
+  await input.evaluate((element) => element.click()).catch(async () => {
+    await row.locator('.p-toggleswitch, .p-toggleswitch-slider').first().click({ force: true }).catch(() => {});
+  });
+  await page.waitForTimeout(750);
+
+  return await input.isChecked().catch(async () => {
+    const root = row.locator('.p-toggleswitch').first();
+    return (await root.getAttribute('data-p-checked').catch(() => 'false')) === 'true';
+  });
+}
+
+function getOwnerOptionLocator(page, ownerListId = '') {
+  const selectors = [];
+  if (ownerListId) {
+    selectors.push(
+      `#${ownerListId} [role="option"]`,
+      `#${ownerListId} .p-multiselect-item`,
+      `#${ownerListId} .p-multiselect-option`,
+      `#${ownerListId} .p-select-option`,
+      `#${ownerListId} [data-pc-section="option"]`,
+      `#${ownerListId} li`,
+    );
   }
 
-  await trigger.click({ force: true });
+  selectors.push(
+    '[role="option"]',
+    '.p-multiselect-item',
+    '.p-multiselect-option',
+    '.p-select-option',
+    '[data-pc-section="option"]',
+  );
+
+  return page.locator(selectors.join(', '));
+}
+
+async function openOwnerSelector(page) {
+  await page.keyboard.press('Escape').catch(() => {});
+
+  const column = getOwnerColumn(page);
+  await column.waitFor({ state: 'visible', timeout: TIMEOUT_MS });
+
+  const multiselect = column.locator('.p-multiselect').first();
+  const hiddenInput = column.locator('.p-hidden-accessible input[role="combobox"]').first();
+  const dropdownTrigger = column.locator('.p-multiselect-dropdown').first();
+  const labelTrigger = column.locator('.p-multiselect-label-container, .p-multiselect-label').first();
+  const fallbackTrigger = column.locator('[role="combobox"], input, button').first();
+
+  let ownerListId = await hiddenInput.getAttribute('aria-controls').catch(() => '');
+  const clickTargets = [dropdownTrigger, labelTrigger, multiselect, hiddenInput, fallbackTrigger];
+
+  for (const target of clickTargets) {
+    if (!(await target.count().catch(() => 0))) continue;
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    await target.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(300);
+
+    const expanded = await hiddenInput.getAttribute('aria-expanded').catch(() => '');
+    ownerListId = ownerListId || await hiddenInput.getAttribute('aria-controls').catch(() => '');
+    if (expanded === 'true') break;
+  }
+
+  const expandedAfterClicks = await hiddenInput.getAttribute('aria-expanded').catch(() => '');
+  if (expandedAfterClicks !== 'true' && (await hiddenInput.count().catch(() => 0))) {
+    await hiddenInput.focus().catch(() => {});
+    await hiddenInput.press('Space').catch(() => {});
+    await page.waitForTimeout(300);
+  }
+
+  const expandedAfterSpace = await hiddenInput.getAttribute('aria-expanded').catch(() => '');
+  if (expandedAfterSpace !== 'true' && (await hiddenInput.count().catch(() => 0))) {
+    await hiddenInput.press('ArrowDown').catch(() => {});
+    await page.waitForTimeout(300);
+  }
+
+  if (ownerListId) {
+    const ownerList = page.locator(`#${ownerListId}`).first();
+    await ownerList.waitFor({ state: 'visible', timeout: 2_000 }).catch(() => {});
+  }
+
+  return { column, ownerListId };
+}
+
+async function readSelectedOwnerText(page) {
+  const column = getOwnerColumn(page);
+  const inputValue = await column.locator('input').first().inputValue().catch(() => '');
+  if (inputValue.trim()) return inputValue.trim();
+
+  const selectedLabel = await column
+    .locator('.p-multiselect-label, .p-dropdown-label, [data-pc-section="label"]')
+    .first()
+    .innerText()
+    .catch(() => '');
+  if (selectedLabel.trim() && normalizeText(selectedLabel) !== 'empty') return selectedLabel.trim();
+
+  return (await column.innerText().catch(() => ''))
+    .split('\n')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .filter((entry) => normalizeText(entry) !== normalizeText(LABELS.owner))
+    .join(' ')
+    .trim();
+}
+
+async function tryTypeOwnerDirectly(page, requestedOwners) {
+  if (!requestedOwners || requestedOwners.length === 0) return false;
+
+  const column = getOwnerColumn(page);
+  const input = column.locator('input').first();
+  if (!(await input.count().catch(() => 0))) return false;
+
+  const ownerName = String(requestedOwners[0] || '').trim();
+  if (!ownerName) return false;
+
+  await input.click({ force: true }).catch(() => {});
+  await input.fill(ownerName).catch(() => {});
+  await page.waitForTimeout(1000);
+  await page.keyboard.press('ArrowDown').catch(() => {});
+  await page.keyboard.press('Enter').catch(() => {});
+  await page.keyboard.press('Tab').catch(() => {});
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(500);
+
+  const selectedOwner = await readSelectedOwnerText(page);
+  return normalizeText(selectedOwner).includes(normalizeText(ownerName));
+}
+
+async function tryClickOwnerByVisibleText(page, requestedOwners, ownerListId = '') {
+  if (!requestedOwners || requestedOwners.length === 0) return false;
+
+  const optionLocator = getOwnerOptionLocator(page, ownerListId);
+  for (const ownerName of requestedOwners) {
+    const normalizedOwnerName = String(ownerName || '').trim();
+    if (!normalizedOwnerName) continue;
+
+    const ownerText = optionLocator.filter({ hasText: normalizedOwnerName }).first();
+    const isVisible = await ownerText.isVisible({ timeout: 3_000 }).catch(() => false);
+    if (!isVisible) continue;
+
+    await ownerText.click({ force: true }).catch(() => {});
+    await page.keyboard.press('Tab').catch(() => {});
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(500);
+
+    const selectedOwner = await readSelectedOwnerText(page);
+    if (normalizeText(selectedOwner).includes(normalizeText(normalizedOwnerName))) return true;
+  }
+
+  return false;
+}
+
+async function saveOwnerSelectionDebugArtifacts(page) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const debugDir = path.join(DOWNLOAD_DIR, 'debug');
+  await ensureDir(debugDir);
+
+  const screenshotPath = path.join(debugDir, `owner-selection-${timestamp}.png`);
+  const htmlPath = path.join(debugDir, `owner-selection-${timestamp}.html`);
+
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+  const html = await page.content().catch(() => '');
+  if (html) await fs.writeFile(htmlPath, html, 'utf8').catch(() => {});
+
+  return { screenshotPath, htmlPath };
 }
 
 async function selectOwners(page) {
   const ownerFilterProvided = Boolean(process.env.DATEV_OWNER_NAMES || process.env.DATEV_OWNER_IDS);
   const requested = parseCsvOrDateRange(process.env.DATEV_OWNER_NAMES || process.env.DATEV_OWNER_IDS || 'Arona GmbH');
-  await openOwnerSelector(page);
 
-  const optionLocator = page.locator('[role="option"], .p-multiselect-item');
+  if (requested.length > 0) {
+    await ensureToggleEnabled(page, LABELS.ownerRestriction);
+  }
+
+  const { ownerListId } = await openOwnerSelector(page);
+
+  const clickedOwnerText = await tryClickOwnerByVisibleText(page, requested, ownerListId);
+  if (clickedOwnerText) return;
+
+  const optionLocator = getOwnerOptionLocator(page, ownerListId);
   await optionLocator.first().waitFor({ state: 'visible', timeout: TIMEOUT_MS }).catch(() => {});
 
   const options = [];
@@ -1136,7 +1334,23 @@ async function selectOwners(page) {
   }
 
   if (options.length === 0) {
-    throw new Error('Could not read DATEV owner options from the dropdown.');
+    const selectedOwner = await readSelectedOwnerText(page);
+    const requestedOwnerAlreadySelected = requested && requested.length > 0
+      ? requested.some((needle) => normalizeText(selectedOwner).includes(normalizeText(needle)))
+      : Boolean(selectedOwner);
+
+    if (requestedOwnerAlreadySelected) {
+      await page.keyboard.press('Escape').catch(() => {});
+      return;
+    }
+
+    const typedOwner = await tryTypeOwnerDirectly(page, requested);
+    if (typedOwner) return;
+
+    const debugArtifacts = await saveOwnerSelectionDebugArtifacts(page);
+    throw new Error(
+      `Could not read DATEV owner options from the dropdown. Debug saved to ${debugArtifacts.screenshotPath} and ${debugArtifacts.htmlPath}.`,
+    );
   }
 
   const targets = requested && requested.length > 0
