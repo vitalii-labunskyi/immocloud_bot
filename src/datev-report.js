@@ -971,6 +971,65 @@ async function sendImportedSheetsToWebhook(imported, metadata = {}) {
   };
 }
 
+async function sendDriveUploadsToWebhook(uploaded, metadata = {}) {
+  if (!GOOGLE_SHEETS_WEBHOOK_ENABLED || uploaded.length === 0) {
+    return null;
+  }
+
+  if (!GOOGLE_SHEETS_WEBHOOK_URL) {
+    throw new Error('GOOGLE_SHEETS_WEBHOOK_URL is required when GOOGLE_SHEETS_WEBHOOK_ENABLED=true.');
+  }
+
+  if (typeof fetch !== 'function') {
+    throw new Error('Webhook delivery requires Node.js 18+ with fetch support.');
+  }
+
+  const files = uploaded.map((item) => ({
+    id: item.id,
+    name: item.name,
+    url: item.webViewLink || item.webContentLink,
+    webViewLink: item.webViewLink,
+    webContentLink: item.webContentLink,
+    localPath: item.localPath,
+  }));
+
+  const payload = {
+    ...metadata,
+    source: 'google-drive',
+    folderId: GOOGLE_DRIVE_FOLDER_ID,
+    count: files.length,
+    links: files.map((item) => item.url).filter(Boolean),
+    files,
+  };
+
+  const headers = {
+    'Content-Type': 'application/json',
+  };
+
+  if (GOOGLE_SHEETS_WEBHOOK_TOKEN) {
+    headers.Authorization = `Bearer ${GOOGLE_SHEETS_WEBHOOK_TOKEN}`;
+  }
+
+  const response = await fetch(GOOGLE_SHEETS_WEBHOOK_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+  const responseText = await response.text().catch(() => '');
+
+  if (!response.ok) {
+    throw new Error(`Google Drive links webhook failed with HTTP ${response.status}: ${responseText.slice(0, 1000)}`);
+  }
+
+  return {
+    url: GOOGLE_SHEETS_WEBHOOK_URL,
+    status: response.status,
+    count: files.length,
+    links: payload.links,
+    response: responseText.slice(0, 1000),
+  };
+}
+
 async function maybeDismissCookieBanner(page) {
   for (const name of ['Ablehnen', 'Akzeptieren', 'Alle akzeptieren', 'Accept all']) {
     const button = page.getByRole('button', { name });
@@ -1491,15 +1550,21 @@ async function main() {
     const downloadResult = await downloadFromHighlightedRow(page, DOWNLOAD_DIR);
     const filesToUpload = downloadResult.processedFiles.length > 0
       ? downloadResult.processedFiles
-      : [downloadResult.archivePath];
+      : downloadResult.originalCsvFiles.length > 0
+        ? downloadResult.originalCsvFiles
+        : [downloadResult.archivePath];
     const driveUploads = await uploadFilesToGoogleDrive(filesToUpload);
     const importedSheets = await importCsvFilesToGoogleSheets(downloadResult.originalCsvFiles);
-    const googleSheetsWebhook = await sendImportedSheetsToWebhook(importedSheets, {
+    const webhookMetadata = {
       startDate: formatIsoDate(startDate),
       endDate: formatIsoDate(endDate),
       fiscalYearStart: formatIsoDate(fiscalYearStart),
       archiveName: path.basename(downloadResult.archivePath),
-    });
+    };
+    const googleDriveWebhook = await sendDriveUploadsToWebhook(driveUploads, webhookMetadata);
+    const googleSheetsWebhook = googleDriveWebhook
+      ? null
+      : await sendImportedSheetsToWebhook(importedSheets, webhookMetadata);
     const webhookUpload = await uploadFilesToWebhook(downloadResult.originalCsvFiles, {
       startDate: formatIsoDate(startDate),
       endDate: formatIsoDate(endDate),
@@ -1513,8 +1578,10 @@ async function main() {
       endDate: formatIsoDate(endDate),
       fiscalYearStart: formatIsoDate(fiscalYearStart),
       ...downloadResult,
+      filesToUpload,
       driveUploads,
       importedSheets,
+      googleDriveWebhook,
       googleSheetsWebhook,
       webhookUpload,
     }, null, 2));
